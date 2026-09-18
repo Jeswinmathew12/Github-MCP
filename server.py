@@ -11,6 +11,8 @@ repos but strongly recommended (unauthenticated requests are limited to 60/hr).
 from __future__ import annotations
 
 import os
+import random
+import time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -43,38 +45,129 @@ def _headers() -> dict:
     return headers
 
 
-def _gh_get(path: str, params: dict | None = None) -> dict | list:
-    """GET a GitHub API path. Raises GitHubError with an LLM-readable message."""
+# Transient-failure policy. Retrying a GET is safe (it is idempotent), so we
+# retry the failures that a second attempt can actually fix: network blips,
+# 5xx responses, and GitHub's *secondary* (abuse-detection) rate limit, which
+# clears in seconds. The primary hourly limit is deliberately excluded — its
+# reset can be an hour away, far longer than a tool call should block a model.
+MAX_ATTEMPTS = 3
+RETRY_BASE_DELAY = 1.0  # seconds, doubled each attempt
+RETRY_MAX_DELAY = 20.0  # cap, applied to backoff and to Retry-After alike
+RETRYABLE_STATUS = (500, 502, 503, 504)
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff with jitter: roughly 1s, 2s, 4s for attempts 0, 1, 2.
+
+    The jitter keeps concurrent tool calls from retrying in lockstep and
+    hammering the API at the same instant.
+    """
+    delay = RETRY_BASE_DELAY * (2 ** attempt)
+    return min(delay + random.uniform(0, delay * 0.1), RETRY_MAX_DELAY)
+
+
+def _retry_after(resp) -> float | None:
+    """Seconds to wait per the response's Retry-After header, if usable."""
+    value = (resp.headers.get("Retry-After") or "").strip()
+    return min(float(value), RETRY_MAX_DELAY) if value.isdigit() else None
+
+
+def _is_primary_rate_limit(resp) -> bool:
+    """True when the hourly quota is exhausted — waiting it out is not viable."""
+    return (
+        resp.status_code in (403, 429)
+        and resp.headers.get("X-RateLimit-Remaining") == "0"
+        and _retry_after(resp) is None
+    )
+
+
+def _is_secondary_rate_limit(resp) -> bool:
+    """True for a short abuse-detection limit, which is worth retrying.
+
+    GitHub signals these either with a Retry-After header or with a message
+    body naming the secondary limit, while hourly quota usually remains.
+    """
+    if resp.status_code not in (403, 429):
+        return False
+    if _retry_after(resp) is not None:
+        return True
     try:
-        resp = requests.get(
-            f"{GITHUB_API}{path}", headers=_headers(), params=params, timeout=15
-        )
-    except requests.RequestException as exc:
-        raise GitHubError(f"Network error talking to GitHub: {exc}") from exc
+        payload = resp.json()
+    except ValueError:
+        return False
+    message = payload.get("message", "") if isinstance(payload, dict) else ""
+    return "secondary rate limit" in message.lower() or "abuse" in message.lower()
 
-    if resp.status_code == 200:
-        return resp.json()
 
+def _status_error(resp, path: str) -> GitHubError:
+    """Map a non-200 response onto a GitHubError the model can act on."""
     if resp.status_code == 404:
-        raise GitHubError(
+        return GitHubError(
             f"GitHub returned 404 for {path}. The repository may not exist, "
             "may be private (set GITHUB_TOKEN), or the name may be misspelled. "
             "Repo names must be in 'owner/name' form."
         )
-    if resp.status_code in (403, 429) and resp.headers.get("X-RateLimit-Remaining") == "0":
+    if resp.status_code == 401:
+        return GitHubError(
+            "GitHub rejected the credentials (401). The GITHUB_TOKEN is invalid or expired."
+        )
+    if _is_primary_rate_limit(resp):
         reset = resp.headers.get("X-RateLimit-Reset", "")
         when = ""
         if reset.isdigit():
             when = f" Limit resets at {datetime.fromtimestamp(int(reset), tz=timezone.utc):%H:%M UTC}."
-        raise GitHubError(
+        return GitHubError(
             "GitHub API rate limit exceeded." + when
             + " Set a GITHUB_TOKEN environment variable to raise the limit from 60 to 5000 requests/hour."
         )
-    if resp.status_code == 401:
-        raise GitHubError(
-            "GitHub rejected the credentials (401). The GITHUB_TOKEN is invalid or expired."
+    if _is_secondary_rate_limit(resp):
+        return GitHubError(
+            "GitHub applied a secondary rate limit (abuse detection) and the "
+            "request kept failing. Slow down and try again shortly."
         )
-    raise GitHubError(f"GitHub API error {resp.status_code} for {path}: {resp.text[:200]}")
+    return GitHubError(f"GitHub API error {resp.status_code} for {path}: {resp.text[:200]}")
+
+
+def _gh_get(path: str, params: dict | None = None) -> dict | list:
+    """GET a GitHub API path, retrying transient failures with backoff.
+
+    Network errors, 5xx responses, and secondary rate limits are retried up to
+    MAX_ATTEMPTS times; a Retry-After header, when GitHub sends one, overrides
+    the computed backoff. Failures a retry cannot fix — 404, 401, a bad repo
+    name, the primary hourly rate limit — are raised immediately.
+
+    Raises GitHubError with an LLM-readable message.
+    """
+    last_error: GitHubError | None = None
+
+    for attempt in range(MAX_ATTEMPTS):
+        final_attempt = attempt == MAX_ATTEMPTS - 1
+
+        try:
+            resp = requests.get(
+                f"{GITHUB_API}{path}", headers=_headers(), params=params, timeout=15
+            )
+        except requests.RequestException as exc:
+            last_error = GitHubError(f"Network error talking to GitHub: {exc}")
+            if final_attempt:
+                break
+            time.sleep(_backoff_delay(attempt))
+            continue
+
+        if resp.status_code == 200:
+            return resp.json()
+
+        if resp.status_code in RETRYABLE_STATUS or _is_secondary_rate_limit(resp):
+            last_error = _status_error(resp, path)
+            if final_attempt:
+                break
+            time.sleep(_retry_after(resp) or _backoff_delay(attempt))
+            continue
+
+        raise _status_error(resp, path)
+
+    # Every attempt failed on something transient.
+    raise GitHubError(f"{last_error} (gave up after {MAX_ATTEMPTS} attempts)")
 
 
 class GitHubError(Exception):

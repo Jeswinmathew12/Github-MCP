@@ -17,6 +17,22 @@ The design goal is a handful of tools that work end-to-end rather than a large s
 
 All tools take `repo` in `owner/name` form (e.g. `python/cpython`). GitHub API errors (bad repo names, 404s, rate limits, bad tokens) are caught and returned as a readable `error` message the model can act on, never a stack trace.
 
+## Handling failure
+
+Every request goes through one helper, `_gh_get`, which retries the failures a second attempt can actually fix and fails fast on the ones it can't:
+
+| Failure | Behaviour | Why |
+|---|---|---|
+| Network error (DNS, reset, timeout) | Retry, up to 3 attempts | Usually a blip |
+| `500` / `502` / `503` / `504` | Retry, up to 3 attempts | GitHub-side, transient; a GET is idempotent so replaying it is safe |
+| Secondary rate limit (abuse detection) | Retry, honouring `Retry-After` | Clears in seconds |
+| **Primary** hourly rate limit | Fail immediately | Reset can be an hour away — far longer than a tool call should block the model |
+| `404`, `401`, malformed repo name | Fail immediately | Retrying cannot change the answer |
+
+Backoff is exponential with jitter (~1s, ~2s, ~4s), capped at 20s, and a server-supplied `Retry-After` overrides the computed delay. When GitHub sends one, we listen to it rather than guessing. The jitter matters when several tool calls fail at once: without it they retry in lockstep and hit the API in a thundering herd.
+
+Whatever the outcome, the caller sees a readable `error` string it can act on — never a stack trace, and never a silent hang.
+
 ## Setup
 
 Requires Python 3.10+.
