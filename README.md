@@ -1,5 +1,7 @@
 # GitHub MCP Server
 
+[![tests](https://github.com/Jeswinmathew12/Github-MCP/actions/workflows/test.yml/badge.svg)](https://github.com/Jeswinmathew12/Github-MCP/actions/workflows/test.yml)
+
 A small, working [Model Context Protocol](https://modelcontextprotocol.io/) server that exposes read-only GitHub tools to an LLM client such as Claude Desktop. Built with the official `mcp` Python SDK (stdio transport) and direct GitHub REST calls via `requests`.
 
 The design goal is a handful of tools that work end-to-end rather than a large stubbed-out surface: an LLM can browse a repo's open issues and PRs, drill into a specific issue's discussion, and summarize recent activity.
@@ -34,11 +36,20 @@ The token is only ever read from the environment — never hardcoded or written 
 
 ## Verify it works (before touching Claude Desktop)
 
-Run the test script, which calls each tool function directly against a real public repo and also exercises the error paths:
+Two suites, for two different questions.
+
+**Unit tests** — the GitHub API is mocked, so they need no network and no token. This is what CI runs on every push:
 
 ```powershell
-python test_tools.py                        # defaults to modelcontextprotocol/python-sdk
-python test_tools.py owner/some-other-repo  # or pick your own
+pip install pytest
+pytest test_server.py
+```
+
+**Live smoke test** — calls each tool function directly against a real public repo and also exercises the error paths, so you can confirm the GitHub integration works before wiring the server into Claude Desktop:
+
+```powershell
+python test_live.py                        # defaults to modelcontextprotocol/python-sdk
+python test_live.py owner/some-other-repo  # or pick your own
 ```
 
 You should see `6/6 checks passed`.

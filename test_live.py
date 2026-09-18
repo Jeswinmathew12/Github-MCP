@@ -5,7 +5,7 @@ functions the MCP server exposes as tools, so you can verify the GitHub
 integration works before wiring the server into Claude Desktop.
 
 Usage:
-    python test_tools.py [owner/repo]
+    python test_live.py [owner/repo]
 
 Defaults to 'modelcontextprotocol/python-sdk' (public, active).
 """
